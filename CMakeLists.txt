@@ -49,8 +49,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(TRITON_TENSORRT_BACKEND_LIBNAME triton_tensorrt)
-set(TRITON_TENSORRT_BACKEND_INSTALLDIR ${CMAKE_INSTALL_PREFIX}/backends/tensorrt)
+set(TRITON_TENSORRT_BACKEND_LIBNAME triton_tensorrt_jz)
+set(TRITON_TENSORRT_BACKEND_INSTALLDIR ${CMAKE_INSTALL_PREFIX}/backends/tensorrt_jz)
 
 
 if(LINUX)
@@ -281,6 +281,15 @@ install(
   FILES
     ${CMAKE_CURRENT_BINARY_DIR}/TritonTensorRTBackendConfig.cmake
   DESTINATION ${INSTALL_CONFIGDIR}
+)
+
+#
+# Copy the library to /srv/triton_models_tensorrt/encoder
+#
+install(
+  CODE "message(STATUS \"Copying ${TRITON_TENSORRT_BACKEND_LIBNAME}.so to /srv/triton_models_tensorrt/encoder\")"
+  CODE "execute_process(COMMAND mkdir -p /srv/triton_models_tensorrt/encoder)"
+  CODE "execute_process(COMMAND cp ${TRITON_TENSORRT_BACKEND_INSTALLDIR}/lib${TRITON_TENSORRT_BACKEND_LIBNAME}.so /srv/triton_models_tensorrt/encoder/)"
 )
 
 #

@@ -1028,6 +1028,64 @@ ModelInstanceState::Run(
       dims = io_binding_info.GetAllocator()->getShape();
     }
 
+    if (name == "max_frame_encoder") {
+      TRITONSERVER_DataType dt = ConvertTrtTypeToDataType(engine_->getTensorDataType(name.c_str()));
+      
+      int num_elements = 1;
+      for (int i = 0; i < dims.nbDims; i++) {
+        num_elements *= dims.d[i];
+      }
+      
+      const void* gpu_buffer = io_binding_info.GetBuffer();
+      size_t buffer_byte_size = io_binding_info.GetByteSize();
+      TRITONSERVER_MemoryType memory_type = io_binding_info.GetMemoryType();
+      int64_t memory_type_id = io_binding_info.GetMemoryTypeId();
+      
+      if (memory_type == TRITONSERVER_MEMORY_GPU) {
+        void* cpu_buffer = malloc(buffer_byte_size);
+        if (cpu_buffer == nullptr) {
+          LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "Failed to allocate CPU buffer for copying tensor data");
+          return;
+        }
+        
+        bool cuda_used = false;
+        TRITONSERVER_Error* err = CopyBuffer(
+            "Tensor data for printing", 
+            memory_type, memory_type_id, // Source - GPU memory
+            TRITONSERVER_MEMORY_CPU, 0,   // Destination - CPU memory
+            buffer_byte_size, gpu_buffer, cpu_buffer, stream_, &cuda_used);
+        
+        if (err != nullptr) {
+          LOG_MESSAGE(
+            TRITONSERVER_LOG_ERROR,
+            (std::string("Failed to copy tensor data from GPU to CPU: ") + 
+              TRITONSERVER_ErrorMessage(err)).c_str());
+          free(cpu_buffer);
+          TRITONSERVER_ErrorDelete(err);
+          return;
+        }
+        
+        if (cuda_used) {
+          cudaStreamSynchronize(stream_);
+        }
+        
+        std::string value_str = name + ": ";
+        
+        if (dt == TRITONSERVER_TYPE_INT32) {
+          const int32_t* values = static_cast<const int32_t*>(cpu_buffer);
+          for (int i = 0; i < num_elements; i++) {
+            value_str += (i == 0) ? std::to_string(values[i]) : ", " + std::to_string(values[i]);
+          }
+        } 
+        else {
+          value_str += "unsupported data type";
+        }
+        
+        LOG_MESSAGE(TRITONSERVER_LOG_INFO, value_str.c_str());
+        free(cpu_buffer);
+      }
+    }
+
     // Make sure each output is of the expected size and copy it into
     // the payload responses.
     bool cuda_copy = false;
