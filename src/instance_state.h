@@ -353,8 +353,10 @@ class ModelInstanceState : public TensorRTModelInstance {
       TRITONBACKEND_Output* response_output, const size_t tensor_element_count,
       const int64_t batch_size, cudaStream_t stream);
   void ProcessResponse();
-
   void GetConfiguredProfiles(std::string* profiles_desc);
+  void DumpTensorsToPickle(
+      std::map<int, TensorRTContext>::iterator& citr,
+      const std::string& reason);
   int CudaStreamPriority() { return cuda_stream_priority_; }
 
   void FindClosestCudaGraph(

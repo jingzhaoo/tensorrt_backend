@@ -28,11 +28,6 @@
 
 #include "tensorrt_utils.h"
 #include "triton/common/nvtx.h"
-#include <fstream>
-#include <sstream>
-#include <chrono>
-#include <iomanip>
-#include <cstdlib>
 
 namespace triton { namespace backend { namespace tensorrt {
 
@@ -411,8 +406,8 @@ ModelInstanceState::Run(
     TRITONBACKEND_Request** requests, const uint32_t request_count)
 {
   LOG_MESSAGE(
-      TRITONSERVER_LOG_VERBOSE,
-      (std::string("TRITONBACKEND_ModelExecute: Running ") + Name() + " with " +
+    TRITONSERVER_LOG_INFO,
+      (std::string("TRITONBACKEND_ModelExecute_jz: Running ") + Name() + " with " +
        std::to_string(request_count) + " requests")
           .c_str());
 
@@ -796,7 +791,7 @@ ModelInstanceState::Run(
 
         // Ensure the request data byte size matches the expected byte size for
         // non-linear IO format tensors
-        if (req_data_byte_size != total_byte_size) {
+        if (static_cast<int64_t>(req_data_byte_size) != total_byte_size) {
           FAIL_ALL_AND_RETURN_IF_ERROR(
               payload_->requests_, payload_->request_count_,
               payload_->responses_,
@@ -971,93 +966,6 @@ ModelInstanceState::Run(
 
   cudaEventRecord(events_[next_set_].ready_for_output_, stream_);
 
-  // Check for large tensor values right after inference completion
-  // This timing ensures all tensor metadata is accessible
-  bool should_dump_tensors = false;
-  for (int io_index = 0; io_index < total_io_tensors_; ++io_index) {
-    const std::string& name = tensor_names_[io_index];
-    if (name.empty()) continue;
-    
-    // Only check tensors we can safely access
-    try {
-      TRITONSERVER_DataType dt = ConvertTrtTypeToDataType(engine_->getTensorDataType(name.c_str()));
-      if (dt != TRITONSERVER_TYPE_INT32) continue;
-      
-      auto& io_binding_info = io_binding_infos_[next_buffer_binding_set_][io_index];
-      nvinfer1::Dims dims = citr->second.context_->getTensorShape(name.c_str());
-      
-      int num_elements = 1;
-      for (int i = 0; i < dims.nbDims; i++) {
-        num_elements *= dims.d[i];
-      }
-      
-      if (num_elements <= 0) continue;
-      
-      // Get threshold value from environment variable, default to 600
-      static int threshold = -1;
-      if (threshold == -1) {
-        const char* env_threshold = std::getenv("TENSORRT_DUMP_THRESHOLD");
-        if (env_threshold != nullptr) {
-          threshold = std::atoi(env_threshold);
-          if (threshold <= 0) {
-            threshold = 600;
-          }
-        } else {
-          threshold = 600;
-        }
-        LOG_MESSAGE(TRITONSERVER_LOG_INFO, 
-                    ("Tensor dump threshold set to: " + std::to_string(threshold)).c_str());
-      }
-      
-      // Check values in this tensor
-      const void* gpu_buffer = io_binding_info.GetBuffer();
-      size_t buffer_byte_size = io_binding_info.GetByteSize();
-      TRITONSERVER_MemoryType memory_type = io_binding_info.GetMemoryType();
-      int64_t memory_type_id = io_binding_info.GetMemoryTypeId();
-      
-      if (memory_type == TRITONSERVER_MEMORY_GPU) {
-        void* cpu_buffer = malloc(buffer_byte_size);
-        if (cpu_buffer != nullptr) {
-          bool cuda_used = false;
-          TRITONSERVER_Error* err = CopyBuffer(
-              "Tensor threshold check", 
-              memory_type, memory_type_id,
-              TRITONSERVER_MEMORY_CPU, 0,
-              buffer_byte_size, gpu_buffer, cpu_buffer, stream_, &cuda_used);
-          
-          if (err == nullptr) {
-            if (cuda_used) {
-              cudaStreamSynchronize(stream_);
-            }
-            
-            const int32_t* values = static_cast<const int32_t*>(cpu_buffer);
-            for (int i = 0; i < num_elements; i++) {
-              if (values[i] > threshold) {
-                should_dump_tensors = true;
-                LOG_MESSAGE(TRITONSERVER_LOG_INFO, 
-                            ("Large value detected in tensor " + name + ": " + std::to_string(values[i])).c_str());
-                break;
-              }
-            }
-          } else {
-            TRITONSERVER_ErrorDelete(err);
-          }
-          free(cpu_buffer);
-        }
-      }
-    } catch (...) {
-      // Skip problematic tensors during threshold check
-      continue;
-    }
-    
-    if (should_dump_tensors) break;
-  }
-  
-  // Dump tensors if large values were found
-  if (should_dump_tensors) {
-    DumpTensorsToPickle(citr, "large_values_detected");
-  }
-
 #ifdef TRITON_ENABLE_STATS
   cudaStreamWaitEvent(signal_stream_, events_[next_set_].ready_for_output_, 0);
   cudaEventRecord(events_[next_set_].compute_output_start_, signal_stream_);
@@ -1105,36 +1013,6 @@ ModelInstanceState::Run(
       model_state_->TritonMemoryManager(), model_state_->MaxBatchSize() > 0,
       model_state_->EnablePinnedOutput(), output_stream,
       events_[next_set_].output_ready_, zero_copy_support_));
-  // Collect tensor info for consolidated logging
-  std::string tensor_info = "Tensor info - ";
-  bool found_tokens = false;
-  for (int io_index = 0; io_index < total_io_tensors_; ++io_index) {
-    auto& io_binding_info =
-        io_binding_infos_[next_buffer_binding_set_][io_index];
-    const std::string& name = tensor_names_[io_index];
-    if (IsInput(engine_.get(), name) && name == "tokens") {
-      nvinfer1::Dims dims;
-      if (!io_binding_info.IsDynamicShapeOutput()) {
-        dims = citr->second.context_->getTensorShape(name.c_str());
-      } else {
-        dims = io_binding_info.GetAllocator()->getShape();
-      }
-      
-      tensor_info += "Input 'tokens': [";
-      for (int i = 0; i < dims.nbDims; i++) {
-        if (i > 0) tensor_info += ", ";
-        tensor_info += std::to_string(dims.d[i]);
-      }
-      tensor_info += "]";
-      found_tokens = true;
-      break;
-    }
-  }
-  
-  if (found_tokens) {
-    LOG_MESSAGE(TRITONSERVER_LOG_INFO, tensor_info.c_str());
-  }
-  
   for (int io_index = 0; io_index < total_io_tensors_; ++io_index) {
     auto& io_binding_info =
         io_binding_infos_[next_buffer_binding_set_][io_index];
@@ -1151,61 +1029,100 @@ ModelInstanceState::Run(
     }
 
     if (name == "max_frame_encoder") {
-      TRITONSERVER_DataType dt = ConvertTrtTypeToDataType(engine_->getTensorDataType(name.c_str()));
-      
-      int num_elements = 1;
-      for (int i = 0; i < dims.nbDims; i++) {
-        num_elements *= dims.d[i];
-      }
-      
-      const void* gpu_buffer = io_binding_info.GetBuffer();
-      size_t buffer_byte_size = io_binding_info.GetByteSize();
-      TRITONSERVER_MemoryType memory_type = io_binding_info.GetMemoryType();
-      int64_t memory_type_id = io_binding_info.GetMemoryTypeId();
-      
-      if (memory_type == TRITONSERVER_MEMORY_GPU) {
-        void* cpu_buffer = malloc(buffer_byte_size);
-        if (cpu_buffer == nullptr) {
-          LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "Failed to allocate CPU buffer for copying tensor data");
-          return;
-        }
+      try {
+        TRITONSERVER_DataType dt = ConvertTrtTypeToDataType(engine_->getTensorDataType(name.c_str()));
         
-        bool cuda_used = false;
-        TRITONSERVER_Error* err = CopyBuffer(
-            "Tensor data for printing", 
-            memory_type, memory_type_id, // Source - GPU memory
-            TRITONSERVER_MEMORY_CPU, 0,   // Destination - CPU memory
-            buffer_byte_size, gpu_buffer, cpu_buffer, stream_, &cuda_used);
+        // Log that we're printing values for this tensor
+        LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Printing values for output tensor '") + name + "'").c_str());
         
-        if (err != nullptr) {
-          LOG_MESSAGE(
-            TRITONSERVER_LOG_ERROR,
-            (std::string("Failed to copy tensor data from GPU to CPU: ") + 
-              TRITONSERVER_ErrorMessage(err)).c_str());
-          free(cpu_buffer);
-          TRITONSERVER_ErrorDelete(err);
-          return;
-        }
-        
-        if (cuda_used) {
-          cudaStreamSynchronize(stream_);
-        }
-        
-        std::string value_str = name + ": ";
-        
-        // Log tensor values for debugging (keeping original functionality)
-        if (dt == TRITONSERVER_TYPE_INT32) {
-          const int32_t* values = static_cast<const int32_t*>(cpu_buffer);
-          for (int i = 0; i < num_elements; i++) {
-            value_str += (i == 0) ? std::to_string(values[i]) : ", " + std::to_string(values[i]);
+        // Calculate tensor size information
+        int num_elements = 1;
+        std::string dims_detail = "";
+        for (int i = 0; i < dims.nbDims; i++) {
+          if (dims_detail.empty()) {
+            dims_detail += "dim[" + std::to_string(i) + "]=" + std::to_string(dims.d[i]);
+          } else {
+            dims_detail += ", dim[" + std::to_string(i) + "]=" + std::to_string(dims.d[i]);
           }
-        }
-        else {
-          value_str += "unsupported data type";
+          num_elements *= dims.d[i];
         }
         
-        LOG_MESSAGE(TRITONSERVER_LOG_INFO, value_str.c_str());
-        free(cpu_buffer);
+        LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Tensor dimensions: [") + dims_detail + "], Total elements: " + 
+           std::to_string(num_elements)).c_str());
+
+        // Get information about the tensor's memory
+        const void* gpu_buffer = io_binding_info.GetBuffer();
+        size_t buffer_byte_size = io_binding_info.GetByteSize();
+        TRITONSERVER_MemoryType memory_type = io_binding_info.GetMemoryType();
+        int64_t memory_type_id = io_binding_info.GetMemoryTypeId();
+        
+        LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Memory type: ") + 
+           (memory_type == TRITONSERVER_MEMORY_GPU ? "GPU" : "CPU") +
+           ", Memory type ID: " + std::to_string(memory_type_id) +
+           ", Buffer size: " + std::to_string(buffer_byte_size)).c_str());
+        
+        // For GPU tensors, we need to copy to host memory first
+        if (memory_type == TRITONSERVER_MEMORY_GPU) {
+          
+          // Allocate CPU buffer to copy the data into
+          void* cpu_buffer = malloc(buffer_byte_size);
+          if (cpu_buffer == nullptr) {
+            LOG_MESSAGE(
+              TRITONSERVER_LOG_ERROR,
+              "Failed to allocate CPU buffer for copying tensor data");
+            return;
+          }
+          
+          // Use CopyBuffer to safely copy from GPU to CPU
+          bool cuda_used = false;
+          TRITONSERVER_Error* err = CopyBuffer(
+              "Tensor data for printing", 
+              memory_type, memory_type_id, // Source - GPU memory
+              TRITONSERVER_MEMORY_CPU, 0,   // Destination - CPU memory
+              buffer_byte_size, gpu_buffer, cpu_buffer, stream_, &cuda_used);
+          
+          if (err != nullptr) {
+            LOG_MESSAGE(
+              TRITONSERVER_LOG_ERROR,
+              (std::string("Failed to copy tensor data from GPU to CPU: ") + 
+               TRITONSERVER_ErrorMessage(err)).c_str());
+            free(cpu_buffer);
+            TRITONSERVER_ErrorDelete(err);
+            return;
+          }
+          
+          // Make sure the copy is complete before reading from cpu_buffer
+          if (cuda_used) {
+            cudaStreamSynchronize(stream_);
+          }
+          
+          // Now safely print values from CPU memory
+          std::string value_str = "Values: ";
+          
+          // Print values based on data type
+          if (dt == TRITONSERVER_TYPE_INT32) {
+            const int32_t* values = static_cast<const int32_t*>(cpu_buffer);
+            for (int i = 0; i < num_elements; i++) {
+              value_str += (i == 0) ? std::to_string(values[i]) : ", " + std::to_string(values[i]);
+            }
+          } 
+          else {
+            value_str += "unsupported data type";
+          }
+          
+          LOG_MESSAGE(
+            TRITONSERVER_LOG_INFO,
+            value_str.c_str());
+          
+          // Free CPU buffer after use
+          free(cpu_buffer);
+        }
       }
     }
 
@@ -4081,256 +3998,4 @@ TRTv3Interface::SetBindingDimensions(
 
   return nullptr;
 }
-
-void
-ModelInstanceState::DumpTensorsToPickle(
-    std::map<int, TensorRTContext>::iterator& citr,
-    const std::string& reason)
-{
-  // Generate timestamp for unique filename
-  auto now = std::chrono::system_clock::now();
-  auto time_t = std::chrono::system_clock::to_time_t(now);
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      now.time_since_epoch()) % 1000;
-  
-  // Get dump directory from environment variable, default to /tmp
-  static std::string dump_dir;
-  static bool dump_dir_initialized = false;
-  if (!dump_dir_initialized) {
-    const char* env_dump_dir = std::getenv("TENSORRT_DUMP_DIR");
-    if (env_dump_dir != nullptr && strlen(env_dump_dir) > 0) {
-      dump_dir = std::string(env_dump_dir);
-      // Ensure directory ends with /
-      if (dump_dir.back() != '/') {
-        dump_dir += '/';
-      }
-    } else {
-      dump_dir = "/tmp/";
-    }
-    dump_dir_initialized = true;
-    LOG_MESSAGE(TRITONSERVER_LOG_INFO, 
-                ("Tensor dump directory set to: " + dump_dir).c_str());
-  }
-  
-  std::stringstream filename_ss;
-  filename_ss << dump_dir << "tensor_dump_" << reason << "_"
-              << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S")
-              << "_" << std::setfill('0') << std::setw(3) << ms.count()
-              << ".dat";
-  std::string filename = filename_ss.str();
-  
-  std::ofstream outfile(filename, std::ios::binary);
-  if (!outfile.is_open()) {
-    LOG_MESSAGE(TRITONSERVER_LOG_ERROR,
-                ("Failed to open file for tensor dump: " + filename).c_str());
-    return;
-  }
-  
-  LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-              ("Dumping tensors to file: " + filename + " (reason: " + reason + ")").c_str());
-  
-  // Write header: number of tensors
-  int32_t num_tensors = 0;
-  
-  // Count only valid tensors that will actually be written
-  for (int io_index = 0; io_index < total_io_tensors_; ++io_index) {
-    const std::string& name = tensor_names_[io_index];
-    
-    // Skip tensors with empty names (same logic as writing loop)
-    if (name.empty()) {
-      continue;
-    }
-    
-    // Check if we can get valid data type (same logic as writing loop)
-    TRITONSERVER_DataType dt = TRITONSERVER_TYPE_INVALID;
-    try {
-      dt = ConvertTrtTypeToDataType(engine_->getTensorDataType(name.c_str()));
-    } catch (...) {
-      continue;
-    }
-    
-    // Skip invalid data types (same logic as writing loop)
-    if (dt == TRITONSERVER_TYPE_INVALID) {
-      continue;
-    }
-    
-    // Check dimensions and element count (same logic as writing loop)
-    auto& io_binding_info = io_binding_infos_[next_buffer_binding_set_][io_index];
-    nvinfer1::Dims dims;
-    try {
-      if (!io_binding_info.IsDynamicShapeOutput()) {
-        dims = citr->second.context_->getTensorShape(name.c_str());
-      } else {
-        dims = io_binding_info.GetAllocator()->getShape();
-      }
-    } catch (...) {
-      continue;
-    }
-    
-    int num_elements = 1;
-    for (int i = 0; i < dims.nbDims; i++) {
-      num_elements *= dims.d[i];
-    }
-    
-    if (num_elements <= 0) {
-      continue;
-    }
-    
-    // This tensor is valid, count it
-    num_tensors++;
-  }
-  
-  LOG_MESSAGE(TRITONSERVER_LOG_INFO, 
-              ("Writing " + std::to_string(num_tensors) + " valid tensors out of " + 
-               std::to_string(total_io_tensors_) + " total tensors").c_str());
-  
-  outfile.write(reinterpret_cast<const char*>(&num_tensors), sizeof(num_tensors));
-  
-  // Dump each tensor
-  for (int io_index = 0; io_index < total_io_tensors_; ++io_index) {
-    auto& io_binding_info = io_binding_infos_[next_buffer_binding_set_][io_index];
-    const std::string& name = tensor_names_[io_index];
-    
-    // Skip tensors with empty names
-    if (name.empty()) {
-      LOG_MESSAGE(TRITONSERVER_LOG_WARN, 
-                  ("Skipping tensor at index " + std::to_string(io_index) + " with empty name").c_str());
-      continue;
-    }
-    
-    bool is_input = IsInput(engine_.get(), name);
-    
-    // Get tensor dimensions with error handling
-    nvinfer1::Dims dims;
-    try {
-      if (!io_binding_info.IsDynamicShapeOutput()) {
-        dims = citr->second.context_->getTensorShape(name.c_str());
-      } else {
-        dims = io_binding_info.GetAllocator()->getShape();
-      }
-    } catch (...) {
-      LOG_MESSAGE(TRITONSERVER_LOG_WARN, 
-                  ("Failed to get dimensions for tensor: " + name).c_str());
-      continue;
-    }
-    
-    // Get data type with error handling
-    TRITONSERVER_DataType dt = TRITONSERVER_TYPE_INVALID;
-    try {
-      dt = ConvertTrtTypeToDataType(engine_->getTensorDataType(name.c_str()));
-    } catch (...) {
-      LOG_MESSAGE(TRITONSERVER_LOG_WARN, 
-                  ("Failed to get data type for tensor: " + name).c_str());
-      continue;
-    }
-    
-    // Validate data type
-    if (dt == TRITONSERVER_TYPE_INVALID) {
-      LOG_MESSAGE(TRITONSERVER_LOG_WARN, 
-                  ("Invalid data type for tensor: " + name).c_str());
-      continue;
-    }
-    
-    int num_elements = 1;
-    for (int i = 0; i < dims.nbDims; i++) {
-      num_elements *= dims.d[i];
-    }
-    
-    if (num_elements <= 0) {
-      LOG_MESSAGE(TRITONSERVER_LOG_WARN, 
-                  ("Skipping tensor " + name + " with " + std::to_string(num_elements) + " elements").c_str());
-      continue;  // Skip empty tensors
-    }
-    
-    // Write tensor metadata
-    // Name length and name
-    int32_t name_len = name.length();
-    outfile.write(reinterpret_cast<const char*>(&name_len), sizeof(name_len));
-    outfile.write(name.c_str(), name_len);
-    
-    // Input/output flag
-    int32_t tensor_type = is_input ? 1 : 0;  // 1 for input, 0 for output
-    outfile.write(reinterpret_cast<const char*>(&tensor_type), sizeof(tensor_type));
-    
-    // Data type
-    int32_t data_type = static_cast<int32_t>(dt);
-    outfile.write(reinterpret_cast<const char*>(&data_type), sizeof(data_type));
-    
-    // Dimensions
-    int32_t num_dims = dims.nbDims;
-    outfile.write(reinterpret_cast<const char*>(&num_dims), sizeof(num_dims));
-    
-    // Build dimensions string for consolidated output
-    std::string dims_str = "[";
-    for (int i = 0; i < dims.nbDims; i++) {
-      int32_t dim_size = dims.d[i];
-      if (i > 0) dims_str += ", ";
-      dims_str += std::to_string(dim_size);
-      outfile.write(reinterpret_cast<const char*>(&dim_size), sizeof(dim_size));
-    }
-    dims_str += "]";
-    
-    // Get buffer info for consolidated output
-    size_t buffer_byte_size = io_binding_info.GetByteSize();
-    
-    // Consolidated print output
-    std::cout << "Dumping tensor: " << name << " | Type: " << (is_input ? "input" : "output") 
-              << " | DataType: " << data_type << " | Dims: " << dims_str 
-              << " | Size: " << buffer_byte_size << " bytes" << std::endl;
-    
-    // Number of elements
-    outfile.write(reinterpret_cast<const char*>(&num_elements), sizeof(num_elements));
-    
-    // Buffer byte size
-    outfile.write(reinterpret_cast<const char*>(&buffer_byte_size), sizeof(buffer_byte_size));
-    
-    // Get tensor data from GPU
-    const void* gpu_buffer = io_binding_info.GetBuffer();
-    TRITONSERVER_MemoryType memory_type = io_binding_info.GetMemoryType();
-    int64_t memory_type_id = io_binding_info.GetMemoryTypeId();
-    
-    if (memory_type == TRITONSERVER_MEMORY_GPU) {
-      // Copy from GPU to CPU for dumping
-      void* cpu_buffer = malloc(buffer_byte_size);
-      if (cpu_buffer == nullptr) {
-        LOG_MESSAGE(TRITONSERVER_LOG_ERROR,
-                    "Failed to allocate CPU buffer for tensor dump");
-        continue;
-      }
-      
-      bool cuda_used = false;
-      TRITONSERVER_Error* err = CopyBuffer(
-          "Tensor dump",
-          memory_type, memory_type_id,  // Source - GPU
-          TRITONSERVER_MEMORY_CPU, 0,   // Destination - CPU
-          buffer_byte_size, gpu_buffer, cpu_buffer, stream_, &cuda_used);
-      
-      if (err != nullptr) {
-        LOG_MESSAGE(TRITONSERVER_LOG_ERROR,
-                    ("Failed to copy tensor data for dump: " +
-                     std::string(TRITONSERVER_ErrorMessage(err))).c_str());
-        free(cpu_buffer);
-        TRITONSERVER_ErrorDelete(err);
-        continue;
-      }
-      
-      if (cuda_used) {
-        cudaStreamSynchronize(stream_);
-      }
-      
-      // Write tensor data
-      outfile.write(reinterpret_cast<const char*>(cpu_buffer), buffer_byte_size);
-      free(cpu_buffer);
-    } else {
-      // Data is already on CPU
-      outfile.write(reinterpret_cast<const char*>(gpu_buffer), buffer_byte_size);
-    }
-  }
-  
-  outfile.close();
-  LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-              ("Successfully dumped " + std::to_string(num_tensors) +
-               " tensors to " + filename).c_str());
-}
-
 }}}  // namespace triton::backend::tensorrt
